@@ -1,0 +1,148 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 security groups for the ALB, Product, Coupon and RDS.'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  AllowedClientCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR permitted to reach the ALB on port 80 (restrict to your IP for a tighter test).
+  AdminCidr:
+    Type: String
+    Default: ''
+    Description: Optional CIDR for emergency SSH (22). Leave blank to rely solely on SSM Session Manager.
+
+Conditions:
+  HasAdminCidr: !Not [!Equals [!Ref AdminCidr, '']]
+
+Resources:
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - public ingress on 80
+      VpcId: !Ref VpcId
+      Tags: [{ Key: Name, Value: cda-alb-sg }]
+
+  ProductSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Product app tier
+      VpcId: !Ref VpcId
+      Tags: [{ Key: Name, Value: cda-product-sg }]
+
+  CouponSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Coupon dependency tier
+      VpcId: !Ref VpcId
+      Tags: [{ Key: Name, Value: cda-coupon-sg }]
+
+  RdsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL - reachable only from Product and Coupon
+      VpcId: !Ref VpcId
+      Tags: [{ Key: Name, Value: cda-rds-sg }]
+
+  AlbIngressHttp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedClientCidr
+      Description: Client HTTP to ALB
+  AlbEgressToProduct:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSg
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      DestinationSecurityGroupId: !Ref ProductSg
+      Description: ALB health checks and forwarding to Product
+
+  ProductIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ProductSg
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      SourceSecurityGroupId: !Ref AlbSg
+      Description: Only the ALB may reach the Product app port
+  ProductIngressSsh:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasAdminCidr
+    Properties:
+      GroupId: !Ref ProductSg
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref AdminCidr
+      Description: Optional emergency SSH
+  ProductEgressAll:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ProductSg
+      IpProtocol: '-1'
+      CidrIp: 0.0.0.0/0
+      Description: Outbound for OS packages, S3, Secrets Manager, CloudWatch, Coupon, RDS
+
+  CouponIngressFromProduct:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CouponSg
+      IpProtocol: tcp
+      FromPort: 9091
+      ToPort: 9091
+      SourceSecurityGroupId: !Ref ProductSg
+      Description: Only Product may reach Coupon
+  CouponIngressSsh:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasAdminCidr
+    Properties:
+      GroupId: !Ref CouponSg
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref AdminCidr
+      Description: Optional emergency SSH
+  CouponEgressAll:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref CouponSg
+      IpProtocol: '-1'
+      CidrIp: 0.0.0.0/0
+      Description: Outbound for OS packages, S3, Secrets Manager, CloudWatch, RDS
+
+  RdsIngressFromProduct:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSg
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref ProductSg
+      Description: MySQL from Product
+  RdsIngressFromCoupon:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSg
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref CouponSg
+      Description: MySQL from Coupon
+
+Outputs:
+  AlbSgId:
+    Value: !Ref AlbSg
+  ProductSgId:
+    Value: !Ref ProductSg
+  CouponSgId:
+    Value: !Ref CouponSg
+  RdsSgId:
+    Value: !Ref RdsSg

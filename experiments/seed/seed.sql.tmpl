@@ -1,0 +1,17 @@
+USE servicedb;
+SET SESSION cte_max_recursion_depth = 100000000;
+
+INSERT INTO product (name, description, price, coupon_code)
+WITH RECURSIVE seq(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM seq WHERE n < @rows
+)
+SELECT
+  CONCAT('Product-', n),
+  CONCAT('Auto-generated product ', n, ' - lorem ipsum dolor sit amet consectetur adipiscing elit'),
+  ROUND(1 + RAND() * 998, 3),
+  ELT(1 + FLOOR(RAND() * 3), 'SAVE10', 'SAVE20', 'BLACKFRIDAY')
+FROM seq;
+
+SELECT COUNT(*) AS product_rows FROM product;

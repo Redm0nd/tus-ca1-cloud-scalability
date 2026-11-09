@@ -1,0 +1,17 @@
+# Build output
+*/target/
+
+# Local experiment evidence (raw run data stays local)
+evidence/raw/
+
+# IDE
+.settings/
+.classpath
+.project
+.factorypath
+.idea/
+.vscode/
+
+# Packaged templates / OS files
+*.packaged.yaml
+.DS_Store

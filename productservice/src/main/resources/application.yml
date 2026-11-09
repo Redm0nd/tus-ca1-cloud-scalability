@@ -1,0 +1,13 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: update
+  datasource:
+    url: jdbc:mysql://localhost:3306/servicedb
+    username: root
+    password: ""
+server:
+  port: 9090
+couponService:
+  url: http://localhost:9091/couponapi/coupons/
+

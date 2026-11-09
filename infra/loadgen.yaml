@@ -1,0 +1,137 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 in-region k6 load generator (separate stack, SSM access only).'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet in the CA1 VPC (cda-public-a)
+  ArtifactBucket:
+    Type: String
+    Description: Deploy bucket - scripts read from loadgen/scripts/, results written to loadgen/results/
+  BaseUrl:
+    Type: String
+    Description: ALB URL exported as BASE_URL on the box, e.g. http://cda-alb-123.eu-west-1.elb.amazonaws.com
+  InstanceType:
+    Type: String
+    Default: c7i-flex.large
+    AllowedValues: [c7i-flex.large, m7i-flex.large, t3.small]
+    Description: >
+      Non-burstable by default so generator CPU never throttles mid-run (a t3 out of
+      credits would distort latency). c7i-flex is Free-plan eligible (c5 is not); m7i-flex.large if k6 needs more RAM.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  LoadGenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: cda-loadgen-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListLoadgenPrefix
+                Effect: Allow
+                Action: [s3:ListBucket]
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}
+                Condition: { StringLike: { 's3:prefix': ['loadgen/*'] } }
+              - Sid: ReadScripts
+                Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}/loadgen/*
+              - Sid: WriteResults
+                Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}/loadgen/results/*
+      Tags: [{ Key: Name, Value: cda-loadgen-role }]
+
+  LoadGenProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref LoadGenRole]
+
+  LoadGenSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: k6 load generator - no ingress (SSM only), egress to ALB/S3/k6 repo
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0, Description: 'ALB + package repos' }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: 'SSM, S3, k6 download' }
+      Tags: [{ Key: Name, Value: cda-loadgen-sg }]
+
+  LoadGenInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref LoadGenProfile
+      Monitoring: true
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref LoadGenSg]
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+      Tags:
+        - { Key: Name, Value: cda-loadgen }
+        - { Key: Tier, Value: loadgen }
+        - { Key: Project, Value: CA1 }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -xo pipefail
+          exec > /var/log/cda-bootstrap.log 2>&1
+          echo "=== CA1 load-gen bootstrap $(date -u) ==="
+          dnf install -y jq
+          dnf install -y https://dl.k6.io/rpm/repo.rpm && dnf install -y k6 || {
+            curl -sL https://github.com/grafana/k6/releases/latest/download/k6-linux-amd64.tar.gz \
+              | tar xz --strip-components=1 -C /usr/local/bin --wildcards '*/k6'; }
+          k6 version
+
+          cat > /etc/security/limits.d/90-k6.conf <<'EOF'
+          *    soft nofile 65535
+          *    hard nofile 65535
+          EOF
+          sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+          sysctl -w net.ipv4.tcp_tw_reuse=1
+
+          mkdir -p /opt/load /opt/load/results
+          aws s3 sync s3://${ArtifactBucket}/loadgen/scripts/ /opt/load/
+          chmod -R a+rwX /opt/load
+
+          cat > /etc/profile.d/cda.sh <<'EOF'
+          export BASE_URL=${BaseUrl}
+          export CDA_BUCKET=${ArtifactBucket}
+          ulimit -n 65535
+          cd /opt/load
+          EOF
+
+          cat > /usr/local/bin/cda-run <<'EOF'
+          #!/bin/bash
+          set -uo pipefail
+          source /etc/profile.d/cda.sh
+          LABEL="$1"; SCRIPT="$2"; shift 2
+          OUT="/opt/load/results/$LABEL"; mkdir -p "$OUT"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/start-utc.txt"
+          k6 run -e BASE_URL="$BASE_URL" --summary-export "$OUT/summary.json" "$@" "/opt/load/$SCRIPT" 2>&1 | tee "$OUT/console.log"
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$OUT/end-utc.txt"
+          aws s3 cp --recursive "$OUT" "s3://$CDA_BUCKET/loadgen/results/$LABEL/" --quiet
+          echo "Uploaded results to s3://$CDA_BUCKET/loadgen/results/$LABEL/"
+          EOF
+          chmod +x /usr/local/bin/cda-run
+          echo "=== load-gen ready $(date -u) ==="
+
+Outputs:
+  InstanceId:
+    Value: !Ref LoadGenInstance
+  PublicIp:
+    Value: !GetAtt LoadGenInstance.PublicIp

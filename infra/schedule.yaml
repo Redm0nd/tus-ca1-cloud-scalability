@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 nightly stop and morning start via EventBridge Scheduler.'
+
+Parameters:
+  Enabled: { Type: String, Default: 'true', AllowedValues: ['true', 'false'] }
+  AsgName: { Type: String }
+  DbInstanceId: { Type: String }
+  CouponInstanceId: { Type: String }
+  RestoreMinSize: { Type: Number, Default: 1 }
+  RestoreDesired: { Type: Number, Default: 1 }
+  Timezone: { Type: String, Default: Europe/Dublin }
+  StopCron: { Type: String, Default: 'cron(0 23 * * ? *)' }
+  StartRdsCron: { Type: String, Default: 'cron(45 6 * * ? *)' }
+  StartAppCron: { Type: String, Default: 'cron(0 7 * * ? *)' }
+
+Conditions:
+  IsEnabled: !Equals [!Ref Enabled, 'true']
+
+Resources:
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Condition: IsEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' }
+      Policies:
+        - PolicyName: cda-scheduler
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [autoscaling:UpdateAutoScalingGroup]
+                Resource: '*'
+              - Effect: Allow
+                Action: [rds:StopDBInstance, rds:StartDBInstance]
+                Resource: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${DbInstanceId}
+              - Effect: Allow
+                Action: [ec2:StopInstances, ec2:StartInstances]
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${CouponInstanceId}
+      Tags: [{ Key: Name, Value: cda-scheduler-role }]
+
+  StopAsgSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsEnabled
+    Properties:
+      Name: cda-stop-asg
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref StopCron
+      ScheduleExpressionTimezone: !Ref Timezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"AutoScalingGroupName":"${AsgName}","MinSize":0,"DesiredCapacity":0}'
+
+  StopCouponSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsEnabled
+    Properties:
+      Name: cda-stop-coupon
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref StopCron
+      ScheduleExpressionTimezone: !Ref Timezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:stopInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"InstanceIds":["${CouponInstanceId}"]}'
+
+  StopRdsSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsEnabled
+    Properties:
+      Name: cda-stop-rds
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref StopCron
+      ScheduleExpressionTimezone: !Ref Timezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:rds:stopDBInstance
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"DbInstanceIdentifier":"${DbInstanceId}"}'
+
+  StartRdsSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsEnabled
+    Properties:
+      Name: cda-start-rds
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref StartRdsCron
+      ScheduleExpressionTimezone: !Ref Timezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:rds:startDBInstance
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"DbInstanceIdentifier":"${DbInstanceId}"}'
+
+  StartCouponSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsEnabled
+    Properties:
+      Name: cda-start-coupon
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref StartAppCron
+      ScheduleExpressionTimezone: !Ref Timezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:ec2:startInstances
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"InstanceIds":["${CouponInstanceId}"]}'
+
+  StartAsgSchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: IsEnabled
+    Properties:
+      Name: cda-start-asg
+      FlexibleTimeWindow: { Mode: 'OFF' }
+      ScheduleExpression: !Ref StartAppCron
+      ScheduleExpressionTimezone: !Ref Timezone
+      State: ENABLED
+      Target:
+        Arn: arn:aws:scheduler:::aws-sdk:autoscaling:updateAutoScalingGroup
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"AutoScalingGroupName":"${AsgName}","MinSize":${RestoreMinSize},"DesiredCapacity":${RestoreDesired}}'

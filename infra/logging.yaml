@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 evidence and logging bucket.'
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cda
+
+Mappings:
+  ElbAccountId:
+    eu-west-1: { id: '156460612806' }
+    eu-west-2: { id: '652711504416' }
+    eu-central-1: { id: '054676820928' }
+    us-east-1: { id: '127311923021' }
+    us-east-2: { id: '033677994240' }
+    us-west-2: { id: '797873946194' }
+
+Resources:
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub ${NamePrefix}-evidence-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-evidence
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - { Key: Name, Value: !Sub '${NamePrefix}-evidence' }
+
+  EvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EvidenceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AlbAccessLogsPut
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - arn:aws:iam::${AccId}:root
+                - AccId: !FindInMap [ElbAccountId, !Ref 'AWS::Region', id]
+            Action: s3:PutObject
+            Resource: !Sub ${EvidenceBucket.Arn}/alb-logs/AWSLogs/${AWS::AccountId}/*
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt EvidenceBucket.Arn
+              - !Sub ${EvidenceBucket.Arn}/*
+            Condition:
+              Bool: { 'aws:SecureTransport': 'false' }
+
+Outputs:
+  EvidenceBucketName:
+    Value: !Ref EvidenceBucket
+  EvidenceBucketArn:
+    Value: !GetAtt EvidenceBucket.Arn
+  AlbLogsPrefix:
+    Value: alb-logs

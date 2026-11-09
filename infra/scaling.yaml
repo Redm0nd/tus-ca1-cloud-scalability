@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 scaling policy: CPU or ALB request-count target tracking, or none.'
+
+Parameters:
+  AsgName: { Type: String }
+  AlbFullName: { Type: String }
+  TargetGroupFullName: { Type: String }
+  ScalingMetric:
+    Type: String
+    Default: None
+    AllowedValues: [None, CPU, RequestCount]
+  CpuTargetValue:
+    Type: Number
+    Default: 40
+    Description: Target average ASG CPU % (chosen below the burstable-credit cliff).
+  RequestCountTargetValue:
+    Type: Number
+    Default: 200
+    Description: Target ALB requests per target per minute.
+  EstimatedWarmup:
+    Type: Number
+    Default: 300
+    Description: Seconds of measured warm-up before a new instance counts toward the metric.
+
+Conditions:
+  UseCpu: !Equals [!Ref ScalingMetric, CPU]
+  UseRequestCount: !Equals [!Ref ScalingMetric, RequestCount]
+
+Resources:
+  CpuTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Condition: UseCpu
+    Properties:
+      AutoScalingGroupName: !Ref AsgName
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: !Ref EstimatedWarmup
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref CpuTargetValue
+
+  RequestCountTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Condition: UseRequestCount
+    Properties:
+      AutoScalingGroupName: !Ref AsgName
+      PolicyType: TargetTrackingScaling
+      EstimatedInstanceWarmup: !Ref EstimatedWarmup
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub ${AlbFullName}/${TargetGroupFullName}
+        TargetValue: !Ref RequestCountTargetValue
+
+Outputs:
+  ActiveScalingMetric:
+    Value: !Ref ScalingMetric

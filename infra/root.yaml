@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 Cloud Scalability and Resilience Investigation (root stack).'
+
+Parameters:
+  ArtifactBucket: { Type: String, Description: S3 bucket holding the JARs and packaged templates }
+  ProductJarKey: { Type: String, Default: artifacts/productservice.jar }
+  CouponJarKey: { Type: String, Default: artifacts/couponservice.jar }
+  ScalingMetric: { Type: String, Default: None, AllowedValues: [None, CPU, RequestCount] }
+  CpuTargetValue: { Type: Number, Default: 40 }
+  RequestCountTargetValue: { Type: Number, Default: 200 }
+  MinSize: { Type: Number, Default: 1 }
+  MaxSize: { Type: Number, Default: 4 }
+  DesiredCapacity: { Type: Number, Default: 1 }
+  ProductInstanceType: { Type: String, Default: t3.micro }
+  CouponInstanceType: { Type: String, Default: t3.micro }
+  ProductXmx: { Type: String, Default: 384m }
+  ProductMaxThreads: { Type: Number, Default: 10 }
+  DBInstanceClass: { Type: String, Default: db.t3.micro }
+  MultiAZ: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  AllowedClientCidr: { Type: String, Default: 0.0.0.0/0 }
+  AdminCidr: { Type: String, Default: '' }
+  CouponPrivateIp: { Type: String, Default: 10.0.0.10 }
+  EnableAlbAccessLogs: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  ScheduleEnabled: { Type: String, Default: 'true', AllowedValues: ['true', 'false'] }
+
+Resources:
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: network.yaml
+      Tags: [{ Key: Component, Value: network }]
+
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: securitygroups.yaml
+      Parameters:
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        AllowedClientCidr: !Ref AllowedClientCidr
+        AdminCidr: !Ref AdminCidr
+      Tags: [{ Key: Component, Value: security }]
+
+  DataStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: data.yaml
+      Parameters:
+        PrivateSubnets: !GetAtt NetworkStack.Outputs.PrivateSubnets
+        RdsSgId: !GetAtt SecurityStack.Outputs.RdsSgId
+        DBInstanceClass: !Ref DBInstanceClass
+        MultiAZ: !Ref MultiAZ
+      Tags: [{ Key: Component, Value: data }]
+
+  LoggingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: logging.yaml
+      Tags: [{ Key: Component, Value: logging }]
+
+  AppStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: app.yaml
+      Parameters:
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PublicSubnets: !GetAtt NetworkStack.Outputs.PublicSubnets
+        CouponSubnet: !GetAtt NetworkStack.Outputs.PublicSubnetA
+        AlbSgId: !GetAtt SecurityStack.Outputs.AlbSgId
+        ProductSgId: !GetAtt SecurityStack.Outputs.ProductSgId
+        CouponSgId: !GetAtt SecurityStack.Outputs.CouponSgId
+        ArtifactBucket: !Ref ArtifactBucket
+        ProductJarKey: !Ref ProductJarKey
+        CouponJarKey: !Ref CouponJarKey
+        DbEndpoint: !GetAtt DataStack.Outputs.DbEndpoint
+        DbName: !GetAtt DataStack.Outputs.DbName
+        DbSecretArn: !GetAtt DataStack.Outputs.DbSecretArn
+        CouponPrivateIp: !Ref CouponPrivateIp
+        ProductInstanceType: !Ref ProductInstanceType
+        CouponInstanceType: !Ref CouponInstanceType
+        MinSize: !Ref MinSize
+        MaxSize: !Ref MaxSize
+        DesiredCapacity: !Ref DesiredCapacity
+        ProductXmx: !Ref ProductXmx
+        ProductMaxThreads: !Ref ProductMaxThreads
+        EvidenceBucketName: !GetAtt LoggingStack.Outputs.EvidenceBucketName
+        EnableAlbAccessLogs: !Ref EnableAlbAccessLogs
+        AlbLogsPrefix: !GetAtt LoggingStack.Outputs.AlbLogsPrefix
+      Tags: [{ Key: Component, Value: app }]
+
+  ScalingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: scaling.yaml
+      Parameters:
+        AsgName: !GetAtt AppStack.Outputs.AsgName
+        AlbFullName: !GetAtt AppStack.Outputs.AlbFullName
+        TargetGroupFullName: !GetAtt AppStack.Outputs.TargetGroupFullName
+        ScalingMetric: !Ref ScalingMetric
+        CpuTargetValue: !Ref CpuTargetValue
+        RequestCountTargetValue: !Ref RequestCountTargetValue
+      Tags: [{ Key: Component, Value: scaling }]
+
+  ScheduleStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: schedule.yaml
+      Parameters:
+        Enabled: !Ref ScheduleEnabled
+        AsgName: !GetAtt AppStack.Outputs.AsgName
+        DbInstanceId: !GetAtt DataStack.Outputs.DbInstanceId
+        CouponInstanceId: !GetAtt AppStack.Outputs.CouponInstanceId
+        RestoreMinSize: !Ref MinSize
+        RestoreDesired: !Ref DesiredCapacity
+      Tags: [{ Key: Component, Value: schedule }]
+
+Outputs:
+  AlbDnsName:
+    Description: Single client-facing endpoint for the Product tier
+    Value: !GetAtt AppStack.Outputs.AlbDnsName
+  AlbUrl:
+    Value: !Sub http://${AppStack.Outputs.AlbDnsName}
+  ProductsApi:
+    Value: !Sub http://${AppStack.Outputs.AlbDnsName}/productapi/products
+  HealthCheck:
+    Value: !Sub http://${AppStack.Outputs.AlbDnsName}/actuator/health
+  AsgName:
+    Value: !GetAtt AppStack.Outputs.AsgName
+  DbEndpoint:
+    Value: !GetAtt DataStack.Outputs.DbEndpoint
+  DbSecretArn:
+    Value: !GetAtt DataStack.Outputs.DbSecretArn
+  CouponInstanceId:
+    Value: !GetAtt AppStack.Outputs.CouponInstanceId
+  CouponPrivateIp:
+    Value: !GetAtt AppStack.Outputs.CouponPrivateIp
+  EvidenceBucket:
+    Value: !GetAtt LoggingStack.Outputs.EvidenceBucketName
+  ActiveScalingMetric:
+    Value: !GetAtt ScalingStack.Outputs.ActiveScalingMetric

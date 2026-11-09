@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 data tier: single-AZ RDS MySQL with an RDS-managed secret.'
+
+Parameters:
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  RdsSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+  DBName:
+    Type: String
+    Default: servicedb
+  DBMasterUsername:
+    Type: String
+    Default: admin
+  MultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  EngineVersion:
+    Type: String
+    Default: '8.0'
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: CA1 private subnets for RDS
+      SubnetIds: !Ref PrivateSubnets
+      Tags: [{ Key: Name, Value: cda-db-subnet-group }]
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      EngineVersion: !Ref EngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      DBInstanceIdentifier: cda-mysql
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      ManageMasterUserPassword: true
+      MultiAZ: !Ref MultiAZ
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSgId]
+      BackupRetentionPeriod: 0
+      DeleteAutomatedBackups: true
+      StorageEncrypted: true
+      EnableCloudwatchLogsExports: [error]
+      Tags:
+        - { Key: Name, Value: cda-mysql }
+        - { Key: Project, Value: CA1 }
+
+Outputs:
+  DbEndpoint:
+    Value: !GetAtt DbInstance.Endpoint.Address
+  DbPort:
+    Value: !GetAtt DbInstance.Endpoint.Port
+  DbName:
+    Value: !Ref DBName
+  DbMasterUsername:
+    Value: !Ref DBMasterUsername
+  DbSecretArn:
+    Value: !GetAtt DbInstance.MasterUserSecret.SecretArn
+  DbInstanceId:
+    Value: !Ref DbInstance

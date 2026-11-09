@@ -1,0 +1,335 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CA1 application tier: Product Auto Scaling Group behind an ALB, single Coupon instance.'
+
+Parameters:
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  PublicSubnets: { Type: List<AWS::EC2::Subnet::Id> }
+  CouponSubnet: { Type: AWS::EC2::Subnet::Id, Description: Subnet (CIDR 10.0.0.0/24) hosting the fixed-IP Coupon instance }
+  AlbSgId: { Type: AWS::EC2::SecurityGroup::Id }
+  ProductSgId: { Type: AWS::EC2::SecurityGroup::Id }
+  CouponSgId: { Type: AWS::EC2::SecurityGroup::Id }
+  ArtifactBucket: { Type: String }
+  ProductJarKey: { Type: String, Default: artifacts/productservice.jar }
+  CouponJarKey: { Type: String, Default: artifacts/couponservice.jar }
+  DbEndpoint: { Type: String }
+  DbName: { Type: String, Default: servicedb }
+  DbSecretArn: { Type: String }
+  CouponPrivateIp: { Type: String, Default: 10.0.0.10 }
+  ProductInstanceType: { Type: String, Default: t3.micro }
+  CouponInstanceType: { Type: String, Default: t3.micro }
+  MinSize: { Type: Number, Default: 1 }
+  MaxSize: { Type: Number, Default: 4 }
+  DesiredCapacity: { Type: Number, Default: 1 }
+  ProductXmx:
+    Type: String
+    Default: 384m
+    Description: >
+      JVM heap. 512m on a t3.micro (913 MiB usable) left ~20 MiB for the OS, SSM and
+      CloudWatch agents once the heap filled, and the whole VM froze. 384m leaves headroom
+      so overload surfaces as slow/failed requests rather than a dead instance.
+  ProductMaxThreads:
+    Type: Number
+    Default: 10
+    Description: >
+      Tomcat worker threads (bulkhead). Each in-flight unpaginated list request holds the
+      whole result set + JSON in heap, so concurrency x payload must fit in -Xmx. Matched
+      to the Hikari pool (10): more threads than DB connections add memory, not throughput.
+  HealthCheckGracePeriod: { Type: Number, Default: 300 }
+  JavaPackage: { Type: String, Default: java-21-amazon-corretto-headless }
+  EvidenceBucketName: { Type: String, Default: '' }
+  EnableAlbAccessLogs: { Type: String, Default: 'false', AllowedValues: ['true', 'false'] }
+  AlbLogsPrefix: { Type: String, Default: alb-logs }
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  AlbLogsOn: !Equals [!Ref EnableAlbAccessLogs, 'true']
+
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: cda-app-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadArtifacts
+                Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}/*
+              - Sid: ReadDbSecret
+                Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref DbSecretArn
+              - Sid: WriteEvidence
+                Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub arn:aws:s3:::${ArtifactBucket}/evidence/*
+      Tags: [{ Key: Name, Value: cda-instance-role }]
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: cda-product-alb
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnets
+      SecurityGroups: [!Ref AlbSgId]
+      LoadBalancerAttributes:
+        !If
+          - AlbLogsOn
+          - - { Key: access_logs.s3.enabled, Value: 'true' }
+            - { Key: access_logs.s3.bucket, Value: !Ref EvidenceBucketName }
+            - { Key: access_logs.s3.prefix, Value: !Ref AlbLogsPrefix }
+            - { Key: idle_timeout.timeout_seconds, Value: '60' }
+          - - { Key: idle_timeout.timeout_seconds, Value: '60' }
+      Tags: [{ Key: Name, Value: cda-product-alb }]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: cda-product-tg
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 9090
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /actuator/health
+      HealthCheckPort: traffic-port
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '30' }
+      Tags: [{ Key: Name, Value: cda-product-tg }]
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  ProductLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: cda-product-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref ProductInstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        Monitoring: { Enabled: true }
+        SecurityGroupIds: [!Ref ProductSgId]
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: cda-product }
+              - { Key: Tier, Value: product }
+              - { Key: Project, Value: CA1 }
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -xo pipefail
+            exec > /var/log/cda-bootstrap.log 2>&1
+            echo "=== CA1 Product bootstrap $(date -u) ==="
+            dnf install -y ${JavaPackage} jq unzip
+            if ! command -v aws >/dev/null 2>&1; then
+              dnf install -y awscli || { curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/aws.zip && unzip -q /tmp/aws.zip -d /tmp && /tmp/aws/install; }
+            fi
+            dnf install -y amazon-cloudwatch-agent || true
+            mkdir -p /opt/app /etc/productservice
+            aws s3 cp s3://${ArtifactBucket}/${ProductJarKey} /opt/app/productservice.jar --region ${AWS::Region}
+            SECRET=$(aws secretsmanager get-secret-value --secret-id ${DbSecretArn} --query SecretString --output text --region ${AWS::Region})
+            DB_USER=$(echo "${!SECRET}" | jq -r .username)
+            DB_PASS=$(echo "${!SECRET}" | jq -r .password)
+            cat >/etc/productservice/application.yml <<EOF
+            spring:
+              datasource:
+                url: jdbc:mysql://${DbEndpoint}:3306/${DbName}?useSSL=true&allowPublicKeyRetrieval=true&serverTimezone=UTC
+                username: ${!DB_USER}
+                password: ${!DB_PASS}
+                hikari:
+                  maximum-pool-size: 10
+                  connection-timeout: 3000
+              jpa:
+                hibernate:
+                  ddl-auto: none
+            couponService:
+              url: http://${CouponPrivateIp}:9091/couponapi/coupons/
+            server:
+              port: 9090
+              tomcat:
+                threads:
+                  max: ${ProductMaxThreads}
+                accept-count: 100
+            management:
+              endpoints:
+                web:
+                  exposure:
+                    include: health,info,metrics
+              endpoint:
+                health:
+                  show-details: always
+                  probes:
+                    enabled: true
+            EOF
+            cat >/etc/systemd/system/productservice.service <<UNIT
+            [Unit]
+            Description=CA1 Product Service
+            After=network-online.target
+            Wants=network-online.target
+            [Service]
+            ExecStart=/usr/bin/java -Xmx${ProductXmx} -XX:+UseG1GC -jar /opt/app/productservice.jar --spring.config.additional-location=file:/etc/productservice/application.yml
+            Restart=always
+            RestartSec=5
+            SuccessExitStatus=143
+            User=ec2-user
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            chown -R ec2-user:ec2-user /opt/app
+            systemctl daemon-reload
+            systemctl enable --now productservice
+            cat >/opt/aws/amazon-cloudwatch-agent/etc/cda-cwagent.json <<CW
+            { "metrics": { "append_dimensions": { "InstanceId": "\${!aws:InstanceId}", "AutoScalingGroupName": "\${!aws:AutoScalingGroupName}" },
+              "aggregation_dimensions": [["AutoScalingGroupName"]],
+              "metrics_collected": { "mem": { "measurement": [{"name":"mem_used_percent"}], "metrics_collection_interval": 60 } } } }
+            CW
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/cda-cwagent.json || true
+            echo "=== bootstrap complete $(date -u) ==="
+
+  ProductAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: cda-product-asg
+      VPCZoneIdentifier: !Ref PublicSubnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ProductLaunchTemplate
+        Version: !GetAtt ProductLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      TargetGroupARNs: [!Ref TargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: !Ref HealthCheckGracePeriod
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - { Key: Name, Value: cda-product, PropagateAtLaunch: true }
+        - { Key: Tier, Value: product, PropagateAtLaunch: true }
+        - { Key: Project, Value: CA1, PropagateAtLaunch: true }
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+
+  CouponInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref CouponInstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      Monitoring: true
+      SubnetId: !Ref CouponSubnet
+      PrivateIpAddress: !Ref CouponPrivateIp
+      SecurityGroupIds: [!Ref CouponSgId]
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+      Tags:
+        - { Key: Name, Value: cda-coupon }
+        - { Key: Tier, Value: coupon }
+        - { Key: Project, Value: CA1 }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -xo pipefail
+          exec > /var/log/cda-bootstrap.log 2>&1
+          echo "=== CA1 Coupon bootstrap $(date -u) ==="
+          dnf install -y ${JavaPackage} jq unzip
+          if ! command -v aws >/dev/null 2>&1; then
+            dnf install -y awscli || { curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/aws.zip && unzip -q /tmp/aws.zip -d /tmp && /tmp/aws/install; }
+          fi
+          mkdir -p /opt/app /etc/couponservice
+          aws s3 cp s3://${ArtifactBucket}/${CouponJarKey} /opt/app/couponservice.jar --region ${AWS::Region}
+          SECRET=$(aws secretsmanager get-secret-value --secret-id ${DbSecretArn} --query SecretString --output text --region ${AWS::Region})
+          DB_USER=$(echo "${!SECRET}" | jq -r .username)
+          DB_PASS=$(echo "${!SECRET}" | jq -r .password)
+          cat >/etc/couponservice/application.yml <<EOF
+          spring:
+            datasource:
+              url: jdbc:mysql://${DbEndpoint}:3306/${DbName}?useSSL=true&allowPublicKeyRetrieval=true&serverTimezone=UTC
+              username: ${!DB_USER}
+              password: ${!DB_PASS}
+            jpa:
+              hibernate:
+                ddl-auto: none
+          server:
+            port: 9091
+          management:
+            endpoints:
+              web:
+                exposure:
+                  include: health,info,metrics
+            endpoint:
+              health:
+                show-details: always
+          EOF
+          cat >/etc/systemd/system/couponservice.service <<UNIT
+          [Unit]
+          Description=CA1 Coupon Service
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          ExecStart=/usr/bin/java -Xmx256m -jar /opt/app/couponservice.jar --spring.config.additional-location=file:/etc/couponservice/application.yml
+          Restart=always
+          RestartSec=5
+          SuccessExitStatus=143
+          User=ec2-user
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          chown -R ec2-user:ec2-user /opt/app
+          systemctl daemon-reload
+          systemctl enable --now couponservice
+          echo "=== bootstrap complete $(date -u) ==="
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+  AlbArn:
+    Value: !Ref Alb
+  AlbFullName:
+    Value: !GetAtt Alb.LoadBalancerFullName
+  TargetGroupArn:
+    Value: !Ref TargetGroup
+  TargetGroupFullName:
+    Value: !GetAtt TargetGroup.TargetGroupFullName
+  AsgName:
+    Value: !Ref ProductAsg
+  CouponInstanceId:
+    Value: !Ref CouponInstance
+  CouponPrivateIp:
+    Value: !Ref CouponPrivateIp
